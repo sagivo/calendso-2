@@ -9,7 +9,7 @@ import { ErrorCode, verifyPassword } from "@lib/auth";
 import { symmetricDecrypt } from "@lib/crypto";
 import prisma from "@lib/prisma";
 import { randomString } from "@lib/random";
-import { isSAMLLoginEnabled, samlLoginUrl } from "@lib/saml";
+import { isSAMLLoginEnabled, samlLoginUrl, hostedCal } from "@lib/saml";
 import slugify from "@lib/slugify";
 
 import { GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, IS_GOOGLE_LOGIN_ENABLED } from "@server/lib/constants";
@@ -124,10 +124,10 @@ if (isSAMLLoginEnabled) {
     profile: (profile) => {
       return {
         id: profile.id || "",
-        firstName: profile.first_name || "",
-        lastName: profile.last_name || "",
+        firstName: profile.firstName || "",
+        lastName: profile.lastName || "",
         email: profile.email || "",
-        name: `${profile.firstName} ${profile.lastName}`,
+        name: `${profile.firstName || ""} ${profile.lastName || ""}`.trim(),
         email_verified: true,
       };
     },
@@ -150,9 +150,29 @@ export default NextAuth({
   },
   providers,
   callbacks: {
-    async jwt({ token, user, account, profile }) {
-      if (!user) {
+    async jwt({ token, user, account }) {
+      const autoMergeIdentities = async () => {
+        if (!hostedCal) {
+          const existingUser = await prisma.user.findFirst({
+            where: { email: token.email! },
+          });
+
+          if (!existingUser) {
+            return token;
+          }
+
+          return {
+            id: existingUser.id,
+            username: existingUser.username,
+            email: existingUser.email,
+          };
+        }
+
         return token;
+      };
+
+      if (!user) {
+        return await autoMergeIdentities();
       }
 
       if (account && account.type === "credentials") {
@@ -165,7 +185,7 @@ export default NextAuth({
 
       // The arguments above are from the provider so we need to look up the
       // user based on those values in order to construct a JWT.
-      if (account && profile && account.type === "oauth" && account.provider) {
+      if (account && account.type === "oauth" && account.provider && account.providerAccountId) {
         let idP: IdentityProvider = IdentityProvider.GOOGLE;
         if (account.provider === "saml") {
           idP = IdentityProvider.SAML;
@@ -178,14 +198,14 @@ export default NextAuth({
                 identityProvider: idP,
               },
               {
-                identityProviderId: profile.id as string,
+                identityProviderId: account.providerAccountId as string,
               },
             ],
           },
         });
 
         if (!existingUser) {
-          return token;
+          return await autoMergeIdentities();
         }
 
         return {
@@ -274,6 +294,11 @@ export default NextAuth({
         });
 
         if (existingUserWithEmail) {
+          // if self-hosted then we can allow auto-merge of identity providers if email is verified
+          if (!hostedCal && existingUserWithEmail.emailVerified) {
+            return true;
+          }
+
           // check if user was invited
           if (
             !existingUserWithEmail.password &&
